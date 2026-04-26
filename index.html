@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>劇本還原引擎 - 語音/手動雙模版</title>
+    <script src="https://unpkg.com/pinyin-pro"></script>
+    <style>
+        body { font-family: "Microsoft JhengHei", sans-serif; background: #f4f7f9; padding: 20px; display: flex; justify-content: center; }
+        .card { background: white; width: 100%; max-width: 1000px; padding: 30px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.1); }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px; }
+        label { font-weight: bold; color: #34495e; display: block; margin-bottom: 8px; }
+        textarea, .display-box { width: 100%; height: 180px; padding: 15px; border: 1px solid #dcdfe6; border-radius: 8px; box-sizing: border-box; font-size: 15px; line-height: 1.6; }
+        .display-box { background: #fafafa; overflow-y: auto; border: 2px solid #3498db; }
+        .btn-group { margin: 15px 0; display: flex; gap: 10px; }
+        button { flex: 1; padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }
+        .btn-start { background: #2ecc71; color: white; }
+        .btn-stop { background: #e74c3c; color: white; }
+        .btn-manual { background: #3498db; color: white; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+        .status-bar { padding: 12px; margin-bottom: 15px; border-radius: 6px; font-size: 14px; background: #ebf5fb; border-left: 5px solid #3498db; }
+        .highlight { background: #fff2cc; color: #d35400; font-weight: bold; border-bottom: 2px solid #f1c40f; padding: 0 2px; border-radius: 3px; }
+        .manual-section { margin-top: 25px; padding-top: 20px; border-top: 2px dashed #eee; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h1>劇本還原引擎 (Hybrid Test)</h1>
+    
+    <div id="statusInfo" class="status-bar">狀態：準備就緒</div>
+
+    <div class="grid">
+        <div>
+            <label>Deepgram API Key:</label>
+            <input type="password" id="apiKey" placeholder="貼上 Key 以執行語音辨識" style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 10px;">
+            
+            <label>1. 關鍵字資料庫 (雲端同步中...)</label>
+            <textarea id="dbInput" readonly placeholder="雲端資料將顯示於此..."></textarea>
+        </div>
+        <div>
+            <label>2. 錄音即時結果</label>
+            <div id="liveOutput" class="display-box" style="color: #2980b9; font-style: italic;"></div>
+            <div class="btn-group">
+                <button id="startBtn" class="btn-start">開啟麥克風</button>
+                <button id="stopBtn" class="btn-stop" disabled>停止並修正</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="manual-section">
+        <label>● 手動輸入測試 (不需錄音，直接貼上錯字嘗試)</label>
+        <div style="display: flex; gap: 10px;">
+            <input type="text" id="manualInput" placeholder="例如輸入：春節緣它的屋頂" style="flex: 4; padding: 12px; border: 1px solid #3498db; border-radius: 6px;">
+            <button id="manualBtn" class="btn-manual">執行手動修正</button>
+        </div>
+    </div>
+
+    <div style="margin-top: 25px;">
+        <label>3. 最終修正結果</label>
+        <div id="finalResult" class="display-box" style="height: 120px;"></div>
+    </div>
+</div>
+
+<script>
+    const { pinyin } = pinyinPro;
+    let mediaRecorder;
+    let socket;
+    let fullTranscript = "";
+    
+    // --- 1. 設定你的雲端資料庫網址 ---
+    const CLOUD_DB_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSf6hszgQYN0ZmI2mlzEoDITSOGprDN6JISt71jqAqBc1pikpC71wysYj_6kGV94eBxjjr5jAsBGbsJ/pub?output=csv"; 
+    let dbFromCloud = [];
+
+    // 取得元件
+    const apiKeyInput = document.getElementById('apiKey');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const manualBtn = document.getElementById('manualBtn');
+    const manualInput = document.getElementById('manualInput');
+    const statusInfo = document.getElementById('statusInfo');
+    const liveOutput = document.getElementById('liveOutput');
+    const finalResult = document.getElementById('finalResult');
+
+    // --- 初始化：從雲端抓取 CSV 資料 ---
+    async function initCloudDatabase() {
+        try {
+            statusInfo.innerText = "狀態：正在同步雲端資料庫...";
+            const response = await fetch(CLOUD_DB_URL);
+            if (!response.ok) throw new Error("網路請求失敗");
+            
+            const csvText = await response.text();
+            const lines = csvText.split('\n');
+            const result = [];
+
+            // 解析 CSV (從第二列開始讀取)
+            for (let i = 1; i < lines.length; i++) {
+                const cols = lines[i].split(',');
+                if (cols.length >= 2) {
+                    const word = cols[0].trim();
+                    const weight = parseFloat(cols[1].trim()) || 1.0;
+                    if (word) result.push({ word, weight });
+                }
+            }
+            dbFromCloud = result;
+            document.getElementById('dbInput').value = JSON.stringify(dbFromCloud, null, 2);
+            statusInfo.innerText = "狀態：雲端資料同步完成！";
+        } catch (err) {
+            console.error(err);
+            statusInfo.innerText = "狀態：雲端連線失敗，請檢查 CSV 網址";
+        }
+    }
+
+    initCloudDatabase();
+
+    // --- 演算法：Levenshtein Similarity ---
+    function getSimilarity(s1, s2) {
+        const len1 = s1.length, len2 = s2.length;
+        const matrix = Array.from({ length: len1 + 1 }, () => []);
+        for (let i = 0; i <= len1; i++) matrix[i][0] = i;
+        for (let j = 0; j <= len2; j++) matrix[0][j] = j;
+        for (let i = 1; i <= len1; i++) {
+            for (let j = 1; j <= len2; j++) {
+                const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+                matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+            }
+        }
+        return (Math.max(len1, len2) - matrix[len1][len2]) / Math.max(len1, len2);
+    }
+
+    // --- 核心加權修正邏輯 ---
+    function runCoreCorrection(text) {
+        if (!text) return "";
+        let db = dbFromCloud; 
+        if (db.length === 0) return text;
+
+        let candidates = [];
+        const dbItems = db.map(item => ({
+            ...item,
+            py: pinyin(item.word, { toneType: 'none' }).replace(/\s/g, '')
+        }));
+
+        dbItems.forEach(item => {
+            const targetPy = item.py;
+            const wordLen = item.word.length;
+
+            for (let len = Math.max(1, wordLen - 1); len <= wordLen + 1; len++) {
+                for (let i = 0; i <= text.length - len; i++) {
+                    const chunk = text.substring(i, i + len);
+                    const chunkPy = pinyin(chunk, { toneType: 'none' }).replace(/\s/g, '');
+                    const sim = getSimilarity(chunkPy, targetPy);
+
+                    if (sim >= 0.65) {
+                        candidates.push({
+                            start: i,
+                            end: i + len,
+                            original: chunk,
+                            correct: item.word,
+                            score: sim * item.weight,
+                            sim: sim
+                        });
+                    }
+                }
+            }
+        });
+
+        candidates.sort((a, b) => b.score - a.score);
+        const used = new Array(text.length).fill(false);
+        const finalReps = [];
+
+        candidates.forEach(cand => {
+            let overlap = false;
+            for (let k = cand.start; k < cand.end; k++) if (used[k]) overlap = true;
+            if (!overlap) {
+                finalReps.push(cand);
+                for (let k = cand.start; k < cand.end; k++) used[k] = true;
+            }
+        });
+
+        finalReps.sort((a, b) => b.start - a.start);
+        let resArr = text.split('');
+        finalReps.forEach(rep => {
+            if (rep.original !== rep.correct) {
+                resArr.splice(rep.start, rep.end - rep.start, `<span class="highlight">${rep.correct}</span>`);
+            }
+        });
+        return resArr.join('');
+    }
+
+    // --- 事件處理 ---
+    manualBtn.onclick = () => {
+        const input = manualInput.value.trim();
+        if(!input) return;
+        finalResult.innerHTML = runCoreCorrection(input);
+        statusInfo.innerText = "狀態：已執行手動修正比對";
+    };
+
+    startBtn.onclick = async () => {
+        const key = apiKeyInput.value.trim();
+        if (!key) return alert("請輸入 Deepgram API Key");
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            socket = new WebSocket(`wss://api.deepgram.com/v1/listen?model=nova-2&language=zh-TW&smart_format=true`, ['token', key]);
+            socket.onopen = () => {
+                statusInfo.innerText = "狀態：語音連線中...";
+                mediaRecorder.start(250);
+            };
+            socket.onmessage = (msg) => {
+                const data = JSON.parse(msg.data);
+                const transcript = data.channel.alternatives[0].transcript;
+                if (transcript && data.is_final) {
+                    fullTranscript += transcript;
+                    liveOutput.innerText = fullTranscript;
+                }
+            };
+            startBtn.disabled = true; stopBtn.disabled = false;
+            fullTranscript = ""; liveOutput.innerText = "";
+        } catch (e) { statusInfo.innerText = "狀態：麥克風啟動失敗"; }
+    };
+
+    stopBtn.onclick = () => {
+        if(mediaRecorder) mediaRecorder.stop();
+        if(socket) socket.close();
+        startBtn.disabled = false; stopBtn.disabled = true;
+        finalResult.innerHTML = runCoreCorrection(fullTranscript);
+        statusInfo.innerText = "狀態：語音修正完成";
+    };
+</script>
+</body>
+</html>
